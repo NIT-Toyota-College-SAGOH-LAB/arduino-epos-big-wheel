@@ -3,10 +3,10 @@
 #include <queue>
 #include <chrono>
 #include <ctime>
-#include <ncurses.h>
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 
 using namespace std::chrono_literals;
 
@@ -61,6 +61,7 @@ class arduino_epos : public rclcpp::Node
 	rclcpp::TimerBase::SharedPtr m_fast_timer;
 	rclcpp::Subscription<std_msgs::msg::String>::SharedPtr m_state_sub;
 	rclcpp::Publisher<std_msgs::msg::String>::SharedPtr m_transmit_pub;
+	rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr m_joy_sub;
 	robot_state m_state;
 
 	std::queue<encoder_node_data_t> m_queue_msg;
@@ -70,8 +71,11 @@ class arduino_epos : public rclcpp::Node
 	std_msgs::msg::String::SharedPtr m_buffer;
 
 	std::chrono::_V2::system_clock::time_point m_pre_time;
+
+	sensor_msgs::msg::Joy::SharedPtr m_joy;
 	
 
+	void joy_callback(sensor_msgs::msg::Joy::ConstSharedPtr);
 	void timer_callback();
 	void fast_timer_callback();
     void state_callback(const std_msgs::msg::String::SharedPtr msg);
@@ -91,6 +95,7 @@ arduino_epos::arduino_epos() : Node("arduino_epos")
 		"epos_recv", 10, std::bind(&arduino_epos::state_callback, this, std::placeholders::_1));
 	this->m_transmit_pub = this->create_publisher<std_msgs::msg::String>("epos_transmit", 10);
 
+	this->m_joy_sub = this->create_subscription<sensor_msgs::msg::Joy>("joy", 10, std::bind(&arduino_epos::joy_callback, this, std::placeholders::_1));
 	this->m_pre_time = std::chrono::system_clock::now();
 }
 
@@ -98,8 +103,8 @@ arduino_epos::~arduino_epos()
 {
 	std::string end_msg;
 
-	static constexpr char header1 = 'h';
-	static constexpr char header2 = 'g';
+	static constexpr char header1 = 'g';
+	static constexpr char header2 = 'h';
 	static const std::string end_code("z\n");
 
 	end_msg += header1;
@@ -115,54 +120,76 @@ arduino_epos::~arduino_epos()
 	this->m_transmit_pub->publish(msg);
 }
 
+void arduino_epos::joy_callback(sensor_msgs::msg::Joy::ConstSharedPtr msg)
+{
+	this->m_joy = std::make_shared<sensor_msgs::msg::Joy>(*msg);
+}
+
 void arduino_epos::timer_callback()
 {
-	auto ch = getch();
 
-	double input;
-	if(ch == 'w')
-	{
-		input = 200.;
-	}
-	else if(ch == 's')
-	{
-		input = -200.;
-	}
-	else
-	{
-		input = 0.;
-	}
+	if(this->m_joy)
+		return;
+
+	double input = 0;
+	double turn = 0;
+
+	constexpr double gain = 100;
+	m_joy->axes[0]; // JOY X Axis
+	m_joy->axes[1]; // JOY Y Axis
+
+	m_joy = nullptr;
+
+	turn = m_joy->axes[0] * gain;
+	input = m_joy->axes[1] * gain;
 
 	int16_t wheel_val = input;
 
 	std::string write_buffer("");
 
-	static constexpr char header1 = 'h';
-	static constexpr char header2 = 'g';
+	static constexpr char header1 = 'g';
+	static constexpr char header2 = 'h';
 	static const std::string end_code("z\n");
 	
-	uint16_t u_wheel_val = wheel_val;
+	uint16_t u_wheel_L_val = wheel_val + turn;
+	uint16_t u_wheel_R_val = wheel_val - turn;
 
 	write_buffer += header1;
-	if (u_wheel_val < 0x1000)
+	if (u_wheel_L_val < 0x1000)
 	{
 		write_buffer += '0';
 	}
-	if (u_wheel_val < 0x0100)
+	if (u_wheel_L_val < 0x0100)
 	{
 		write_buffer += '0';
 	}
-	if (u_wheel_val < 0x0010)
+	if (u_wheel_L_val < 0x0010)
 	{
 		write_buffer += '0';
 	}
 	
-	std::stringstream write_one_digit_data;
-	write_one_digit_data << std::hex << u_wheel_val;
-	write_buffer += write_one_digit_data.str();
+	std::stringstream write_R_digit_data;
+	std::stringstream write_L_digit_data;
+	write_L_digit_data << std::hex << u_wheel_L_val;
+	write_buffer += write_L_digit_data.str();
 
     write_buffer += header2;
-	write_buffer += write_one_digit_data.str();
+	if (u_wheel_R_val < 0x1000)
+	{
+		write_buffer += '0';
+	}
+	if (u_wheel_R_val < 0x0100)
+	{
+		write_buffer += '0';
+	}
+	if (u_wheel_R_val < 0x0010)
+	{
+		write_buffer += '0';
+	}
+	write_R_digit_data << std::hex << u_wheel_R_val;
+	write_buffer += write_R_digit_data.str();
+
+	// RCLCPP_INFO(this->get_logger(), "message %s", write_buffer);
 
 	write_buffer += end_code;
 
@@ -231,7 +258,7 @@ void arduino_epos::encoder_node()
 	}
 	auto duration = std::chrono::system_clock::now() - m_pre_time;
 
-	double duration_sec = std::chrono::duration<double> (duration).count();
+	auto duration_sec = std::chrono::duration<double> (duration).count();
 	m_state.wheel_L_angular_velocity_rad_s = (enc_rotations[0] - pre_enc_rotations[0]) / duration_sec;
 	m_state.wheel_R_angular_velocity_rad_s = (enc_rotations[1] - pre_enc_rotations[1]) / duration_sec;
 
@@ -240,23 +267,16 @@ void arduino_epos::encoder_node()
 		pre_enc_rotations[i] = enc_rotations[i];
 	}
 
-	RCLCPP_INFO(this->get_logger(), "R_angular_velocity: %lf", m_state.wheel_R_angular_velocity_rad_s);
-	RCLCPP_INFO(this->get_logger(), "L_angular_velocity: %lf", m_state.wheel_L_angular_velocity_rad_s);
+	// RCLCPP_INFO(this->get_logger(), "R_angular_velocity: %lf", m_state.wheel_R_angular_velocity_rad_s);
+	// RCLCPP_INFO(this->get_logger(), "L_angular_velocity: %lf", m_state.wheel_L_angular_velocity_rad_s);
 
 	m_pre_time = std::chrono::system_clock::now();
 }
 
 int main(int argc, char ** argv)
 {
-	initscr();
-	cbreak();
-	noecho();
-	scrollok(stdscr, TRUE);
-	nodelay(stdscr, TRUE);
 
 	rclcpp::init(argc, argv);
 	rclcpp::spin(std::make_shared<arduino_epos>());
 	rclcpp::shutdown();
-
-	endwin();
 }
