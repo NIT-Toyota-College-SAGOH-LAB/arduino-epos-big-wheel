@@ -73,6 +73,8 @@ class arduino_epos : public rclcpp::Node
 	std::chrono::_V2::system_clock::time_point m_pre_time;
 
 	sensor_msgs::msg::Joy::SharedPtr m_joy;
+
+	double m_L_gain, m_R_gain;
 	
 
 	void joy_callback(sensor_msgs::msg::Joy::ConstSharedPtr);
@@ -89,14 +91,22 @@ public:
 
 arduino_epos::arduino_epos() : Node("arduino_epos")
 {
-	this->m_timer = this->create_wall_timer(50ms, std::bind(&arduino_epos::timer_callback, this));
+	this->m_timer = this->create_wall_timer(100ms, std::bind(&arduino_epos::timer_callback, this));
 	this->m_fast_timer = this->create_wall_timer(1ms, std::bind(&arduino_epos::fast_timer_callback, this));
 	this->m_state_sub = this->create_subscription<std_msgs::msg::String>(
 		"epos_recv", 10, std::bind(&arduino_epos::state_callback, this, std::placeholders::_1));
 	this->m_transmit_pub = this->create_publisher<std_msgs::msg::String>("epos_transmit", 10);
 
-	this->m_joy_sub = this->create_subscription<sensor_msgs::msg::Joy>("joy", 10, std::bind(&arduino_epos::joy_callback, this, std::placeholders::_1));
+	this->m_joy_sub = this->create_subscription<sensor_msgs::msg::Joy>(
+		"joy", 10, std::bind(&arduino_epos::joy_callback, this, std::placeholders::_1));
 	this->m_pre_time = std::chrono::system_clock::now();
+
+
+	this->declare_parameter("l_gain", 0.0);
+	this->declare_parameter("r_gain", 0.0);
+
+	m_L_gain = this->get_parameter("l_gain").as_double();
+	m_R_gain = this->get_parameter("r_gain").as_double();
 }
 
 arduino_epos::~arduino_epos()
@@ -127,23 +137,18 @@ void arduino_epos::joy_callback(sensor_msgs::msg::Joy::ConstSharedPtr msg)
 
 void arduino_epos::timer_callback()
 {
-
-	if(this->m_joy)
+	if(not this->m_joy)
 		return;
 
 	double input = 0;
 	double turn = 0;
 
-	constexpr double gain = 100;
-	m_joy->axes[0]; // JOY X Axis
-	m_joy->axes[1]; // JOY Y Axis
+	turn  = m_joy->axes[0]; // JOY X Axis
+	input = m_joy->axes[1]; // JOY Y Axis
 
 	m_joy = nullptr;
 
-	turn = m_joy->axes[0] * gain;
-	input = m_joy->axes[1] * gain;
-
-	int16_t wheel_val = input;
+	double wheel_val = input;
 
 	std::string write_buffer("");
 
@@ -151,8 +156,8 @@ void arduino_epos::timer_callback()
 	static constexpr char header2 = 'h';
 	static const std::string end_code("z\n");
 	
-	uint16_t u_wheel_L_val = wheel_val + turn;
-	uint16_t u_wheel_R_val = wheel_val - turn;
+	uint16_t u_wheel_L_val = (wheel_val + turn) * m_L_gain;
+	uint16_t u_wheel_R_val = (wheel_val - turn) * m_R_gain;
 
 	write_buffer += header1;
 	if (u_wheel_L_val < 0x1000)
@@ -189,7 +194,7 @@ void arduino_epos::timer_callback()
 	write_R_digit_data << std::hex << u_wheel_R_val;
 	write_buffer += write_R_digit_data.str();
 
-	// RCLCPP_INFO(this->get_logger(), "message %s", write_buffer);
+	RCLCPP_INFO(this->get_logger(), "message %s", write_buffer.c_str());
 
 	write_buffer += end_code;
 
@@ -210,7 +215,7 @@ void arduino_epos::state_callback(const std_msgs::msg::String::SharedPtr msg)
 	// カノニカルモードでやってるからこないと困る
 	if(msg->data.size() != msg_constants::HEADERS.size() * (msg_constants::SECTION_DATA_LENGTH + 1) + msg_constants::END_CODE.size())
 	{
-		RCLCPP_INFO(this->get_logger(), "msg size: %d, necessary data size: %d", msg->data.size(), msg_constants::HEADERS.size() * (msg_constants::SECTION_DATA_LENGTH + 1) + msg_constants::END_CODE.size());
+		RCLCPP_INFO(this->get_logger(), "msg size: %ld, necessary data size: %ld", msg->data.size(), msg_constants::HEADERS.size() * (msg_constants::SECTION_DATA_LENGTH + 1) + msg_constants::END_CODE.size());
 		RCLCPP_INFO(this->get_logger(), "Invalid data length");
 		return;
 	}
@@ -240,7 +245,7 @@ void arduino_epos::encoder_node()
 	// decode and calculate wheel angular velocity
 	static double pre_enc_rotations[2] = {0.0, 0.0};
 	double enc_rotations[2] = {0.0, 0.0};
-	double weight_rotation = 0;
+	//double weight_rotation = 0;
 
 	for(int enc_rot_num = 0; enc_rot_num < 2; enc_rot_num++)
 	{
@@ -275,7 +280,6 @@ void arduino_epos::encoder_node()
 
 int main(int argc, char ** argv)
 {
-
 	rclcpp::init(argc, argv);
 	rclcpp::spin(std::make_shared<arduino_epos>());
 	rclcpp::shutdown();
